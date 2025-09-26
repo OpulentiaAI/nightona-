@@ -5,6 +5,30 @@ import { SandboxManager, type SandboxState, type Message } from './sandbox-manag
 // Export the Durable Object class
 export { SandboxManager };
 
+const PROJECT_DIR = '/workspace/project';
+const TEMPLATE_DIR = '/workspace/template';
+
+type PM2ProcessInfo = {
+  name?: string;
+  pm2_env?: {
+    status?: string | null;
+  } | null;
+};
+
+async function setupProjectDirectory(sandbox: Sandbox) {
+  console.log(`Ensuring project directory exists at ${PROJECT_DIR}...`);
+  const prepareProject = [
+    `if [ ! -d ${PROJECT_DIR} ] || [ ! -f ${PROJECT_DIR}/package.json ]; then ` +
+      `rm -rf ${PROJECT_DIR} && cp -r ${TEMPLATE_DIR} ${PROJECT_DIR}; ` +
+    `fi`
+  ].join('');
+
+  await sandbox.process.executeCommand(prepareProject);
+  await sandbox.process.executeCommand(`mkdir -p ${PROJECT_DIR}`);
+  await sandbox.process.executeCommand(`chown -R claude:claude ${PROJECT_DIR}`);
+  console.log('Project directory is ready');
+}
+
 async function ensureDevServerRunning(sandbox: Sandbox) {
   console.log('Ensuring dev server is running with PM2...');
 
@@ -15,8 +39,8 @@ async function ensureDevServerRunning(sandbox: Sandbox) {
     if (statusCheck.exitCode === 0) {
       // Process exists, check if it's actually online
       const listResult = await sandbox.process.executeCommand('pm2 jlist');
-      const processes = JSON.parse(listResult.result);
-      const viteProcess = processes.find((p: any) => p.name === 'vite-dev-server');
+      const processes = JSON.parse(listResult.result) as PM2ProcessInfo[];
+      const viteProcess = processes.find((process) => process.name === 'vite-dev-server');
 
       if (viteProcess?.pm2_env?.status === 'online') {
         console.log('Dev server is already running with PM2');
@@ -32,9 +56,15 @@ async function ensureDevServerRunning(sandbox: Sandbox) {
     console.log('PM2 process check failed, will start new process');
   }
 
+  const directoryCheck = await sandbox.process.executeCommand(`test -d ${PROJECT_DIR}`);
+  if (directoryCheck.exitCode !== 0) {
+    console.log('Project directory missing, recreating from template...');
+    await setupProjectDirectory(sandbox);
+  }
+
   // Process doesn't exist, start it
   console.log('Starting new dev server process with PM2...');
-  await sandbox.process.executeCommand('cd /tmp/project && pm2 start ecosystem.config.cjs');
+  await sandbox.process.executeCommand(`cd ${PROJECT_DIR} && pm2 start ecosystem.config.cjs`);
   console.log('Dev server started with PM2');
 
   // Wait a moment for the server to start
@@ -76,7 +106,7 @@ async function getOrCreateSandbox(
             return sandbox;
           }
         } catch (error) {
-          console.log('Dev server health check failed, ensuring it\'s running...');
+          console.log('Dev server health check failed, ensuring it\'s running...', error);
           await ensureDevServerRunning(sandbox);
           return sandbox;
         }
@@ -175,19 +205,14 @@ export default {
         await sandbox.process.executeCommand('id claude || useradd -m -s /bin/bash claude');
         console.log('Claude user created');
 
-        // Copy pre-built template from image to project directory
+        // Copy pre-built template from image to persistent project directory
         console.log('Setting up project from pre-built template...');
-        await sandbox.process.executeCommand('cp -r /workspace/template /tmp/project');
+        await setupProjectDirectory(sandbox);
         console.log('Project template copied successfully');
-
-        // Set ownership of the project directory to claude user
-        console.log('Setting project directory ownership...');
-        await sandbox.process.executeCommand('chown -R claude:claude /tmp/project');
-        console.log('Project directory ownership set to claude user');
 
         // Start the Vite dev server with PM2
         console.log('Starting Vite dev server with PM2...');
-        await sandbox.process.executeCommand('cd /tmp/project && pm2 start ecosystem.config.cjs');
+        await sandbox.process.executeCommand(`cd ${PROJECT_DIR} && pm2 start ecosystem.config.cjs`);
         await sandbox.process.executeCommand('pm2 save'); // Save PM2 process list
         console.log('Dev server started with PM2');
 
@@ -271,7 +296,7 @@ export default {
         // Use --continue to maintain conversation continuity and run as claude user
         // Use base64 encoding to avoid shell escaping issues entirely
         const messageBase64 = btoa(message);
-        const claudeCommand = `su claude -c "cd /tmp/project && claude --dangerously-skip-permissions -p \\"\\$(echo '${messageBase64}' | base64 -d)\\" --continue --output-format json"`;
+        const claudeCommand = `su claude -c "cd ${PROJECT_DIR} && claude --dangerously-skip-permissions -p \\"\\$(echo '${messageBase64}' | base64 -d)\\" --continue --output-format json"`;
         const response = await sandbox.process.executeCommand(claudeCommand);
 
         // Store the AI response and return it
@@ -414,7 +439,7 @@ export default {
         const sandbox = await getOrCreateSandbox(daytona, CLAUDE_SNAPSHOT_NAME, env, sandboxState);
 
         // Clear the Claude session by changing to project directory and running reset command
-        const resetCommand = `cd project && claude --new-session`;
+        const resetCommand = `su claude -c "cd ${PROJECT_DIR} && claude --new-session"`;
         await sandbox.process.executeCommand(resetCommand);
 
         // Clear the message history
